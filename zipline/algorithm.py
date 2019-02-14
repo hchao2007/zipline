@@ -84,6 +84,7 @@ from zipline.assets import Asset, Equity, Future
 from zipline.gens.tradesimulation import AlgorithmSimulator
 from zipline.finance.metrics import MetricsTracker, load as load_metrics_set
 from zipline.pipeline import Pipeline
+import zipline.pipeline.domain as domain
 from zipline.pipeline.engine import (
     ExplodingPipelineEngine,
     SimplePipelineEngine,
@@ -101,6 +102,7 @@ from zipline.utils.input_validation import (
     expect_dtypes,
     expect_types,
     optional,
+    optionally,
 )
 from zipline.utils.numpy_utils import int64_dtype
 from zipline.utils.pandas_utils import normalize_date
@@ -412,8 +414,8 @@ class TradingAlgorithm(object):
         if get_loader is not None:
             self.engine = SimplePipelineEngine(
                 get_loader,
-                self.trading_calendar.all_sessions,
                 self.asset_finder,
+                self.default_pipeline_domain(self.trading_calendar),
             )
         else:
             self.engine = ExplodingPipelineEngine()
@@ -791,6 +793,7 @@ class TradingAlgorithm(object):
                   mask=True,
                   symbol_column=None,
                   special_params_checker=None,
+                  country_code=None,
                   **kwargs):
         """Fetch a csv from a remote url and register the data so that it is
         queryable from the ``data`` object.
@@ -826,6 +829,8 @@ class TradingAlgorithm(object):
             argument is the name of the column in the preprocessed dataframe
             containing the symbols. This will be used along with the date
             information to map the sids in the asset finder.
+        country_code : str, optional
+            Country code to use to disambiguate symbol lookups.
         **kwargs
             Forwarded to :func:`pandas.read_csv`.
 
@@ -834,6 +839,10 @@ class TradingAlgorithm(object):
         csv_data_source : zipline.sources.requests_csv.PandasRequestsCSV
             A requests source that will pull data from the url specified.
         """
+        if country_code is None:
+            country_code = self.default_fetch_csv_country_code(
+                self.trading_calendar,
+            )
 
         # Show all the logs every time fetcher is used.
         csv_data_source = PandasRequestsCSV(
@@ -851,6 +860,7 @@ class TradingAlgorithm(object):
             mask,
             symbol_column,
             data_frequency=self.data_frequency,
+            country_code=country_code,
             special_params_checker=special_params_checker,
             **kwargs
         )
@@ -924,7 +934,7 @@ class TradingAlgorithm(object):
         if calendar is None:
             cal = self.trading_calendar
         elif calendar is calendars.US_EQUITIES:
-            cal = get_calendar('NYSE')
+            cal = get_calendar('XNYS')
         elif calendar is calendars.US_FUTURES:
             cal = get_calendar('us_futures')
         else:
@@ -986,42 +996,6 @@ class TradingAlgorithm(object):
         self.benchmark_sid = benchmark
 
     @api_method
-    @preprocess(symbol_str=ensure_upper_case)
-    def symbol(self, symbol_str):
-        """Lookup an Equity by its ticker symbol.
-
-        Parameters
-        ----------
-        symbol_str : str
-            The ticker symbol for the equity to lookup.
-
-        Returns
-        -------
-        equity : Equity
-            The equity that held the ticker symbol on the current
-            symbol lookup date.
-
-        Raises
-        ------
-        SymbolNotFound
-            Raised when the symbols was not held on the current lookup date.
-
-        See Also
-        --------
-        :func:`zipline.api.set_symbol_lookup_date`
-        """
-        # If the user has not set the symbol lookup date,
-        # use the end_session as the date for sybmol->sid resolution.
-        _lookup_date = self._symbol_lookup_date \
-            if self._symbol_lookup_date is not None \
-            else self.sim_params.end_session
-
-        return self.asset_finder.lookup_symbol(
-            symbol_str,
-            as_of_date=_lookup_date,
-        )
-
-    @api_method
     @preprocess(root_symbol_str=ensure_upper_case)
     def continuous_future(self,
                           root_symbol_str,
@@ -1058,13 +1032,59 @@ class TradingAlgorithm(object):
         )
 
     @api_method
-    def symbols(self, *args):
+    @preprocess(
+        symbol_str=ensure_upper_case,
+        country_code=optionally(ensure_upper_case),
+    )
+    def symbol(self, symbol_str, country_code=None):
+        """Lookup an Equity by its ticker symbol.
+
+        Parameters
+        ----------
+        symbol_str : str
+            The ticker symbol for the equity to lookup.
+        country_code : str or None, optional
+            A country to limit symbol searches to.
+
+        Returns
+        -------
+        equity : Equity
+            The equity that held the ticker symbol on the current
+            symbol lookup date.
+
+        Raises
+        ------
+        SymbolNotFound
+            Raised when the symbols was not held on the current lookup date.
+
+        See Also
+        --------
+        :func:`zipline.api.set_symbol_lookup_date`
+        """
+        # If the user has not set the symbol lookup date,
+        # use the end_session as the date for symbol->sid resolution.
+        _lookup_date = self._symbol_lookup_date \
+            if self._symbol_lookup_date is not None \
+            else self.sim_params.end_session
+
+        return self.asset_finder.lookup_symbol(
+            symbol_str,
+            as_of_date=_lookup_date,
+            country_code=country_code,
+        )
+
+    @api_method
+    def symbols(self, *args, **kwargs):
         """Lookup multuple Equities as a list.
 
         Parameters
         ----------
         *args : iterable[str]
             The ticker symbols to lookup.
+        country_code : str or None, optional
+            A country to limit symbol searches to.
+
+
 
         Returns
         -------
@@ -1082,7 +1102,7 @@ class TradingAlgorithm(object):
         --------
         :func:`zipline.api.set_symbol_lookup_date`
         """
-        return [self.symbol(identifier) for identifier in args]
+        return [self.symbol(identifier, **kwargs) for identifier in args]
 
     @api_method
     def sid(self, sid):
@@ -2345,6 +2365,27 @@ class TradingAlgorithm(object):
             self.engine.run_pipeline(pipeline, start_session, end_session), \
             end_session
 
+    @staticmethod
+    def default_pipeline_domain(calendar):
+        """
+        Get a default pipeline domain for algorithms running on ``calendar``.
+
+        This will be used to infer a domain for pipelines that only use generic
+        datasets when running in the context of a TradingAlgorithm.
+        """
+        return _DEFAULT_DOMAINS.get(calendar.name, domain.GENERIC)
+
+    @staticmethod
+    def default_fetch_csv_country_code(calendar):
+        """
+        Get a default country_code to use for fetch_csv symbol lookups.
+
+        This will be used to disambiguate symbol lookups for fetch_csv calls if
+        our asset db contains entries with the same ticker spread across
+        multiple
+        """
+        return _DEFAULT_FETCH_CSV_COUNTRY_CODES.get(calendar.name)
+
     ##################
     # End Pipeline API
     ##################
@@ -2358,3 +2399,13 @@ class TradingAlgorithm(object):
             fn for fn in itervalues(vars(cls))
             if getattr(fn, 'is_api_method', False)
         ]
+
+
+# Map from calendar name to default domain for that calendar.
+_DEFAULT_DOMAINS = {d.calendar_name: d for d in domain.BUILT_IN_DOMAINS}
+# Map from calendar name to default country code for that calendar.
+_DEFAULT_FETCH_CSV_COUNTRY_CODES = {
+    d.calendar_name: d.country_code for d in domain.BUILT_IN_DOMAINS
+}
+# Include us_futures, which doesn't have a pipeline domain.
+_DEFAULT_FETCH_CSV_COUNTRY_CODES['us_futures'] = 'US'
