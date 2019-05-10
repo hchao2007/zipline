@@ -3,6 +3,7 @@ Tests for chunked adjustments.
 """
 from collections import namedtuple
 from itertools import chain, product
+from string import ascii_lowercase, ascii_uppercase
 from textwrap import dedent
 from unittest import TestCase
 
@@ -19,12 +20,15 @@ from toolz import curry
 
 from zipline.errors import WindowLengthNotPositive, WindowLengthTooLong
 from zipline.lib.adjustment import (
-    Datetime64Overwrite,
+    Boolean1DArrayOverwrite,
+    BooleanOverwrite,
     Datetime641DArrayOverwrite,
+    Datetime64Overwrite,
+    Float641DArrayOverwrite,
     Float64Multiply,
     Float64Overwrite,
-    Float641DArrayOverwrite,
     Int64Overwrite,
+    Object1DArrayOverwrite,
     ObjectOverwrite,
 )
 from zipline.lib.adjusted_array import AdjustedArray
@@ -35,6 +39,7 @@ from zipline.utils.numpy_utils import (
     coerce_to_dtype,
     datetime64ns_dtype,
     default_missing_value_for_dtype,
+    bool_dtype,
     float64_dtype,
     int64_dtype,
     object_dtype,
@@ -239,6 +244,7 @@ def _gen_overwrite_adjustment_cases(dtype):
         bytes_dtype: ObjectOverwrite,
         unicode_dtype: ObjectOverwrite,
         object_dtype: ObjectOverwrite,
+        bool_dtype: BooleanOverwrite,
     }[dtype]
     make_expected_dtype = as_dtype(dtype)
     missing_value = default_missing_value_for_dtype(datetime64ns_dtype)
@@ -337,6 +343,7 @@ def _gen_overwrite_1d_array_adjustment_case(dtype):
     and our own LabelArray class for strings.
     """
     adjustment_type = {
+        bool_dtype: Boolean1DArrayOverwrite,
         float64_dtype: Float641DArrayOverwrite,
         datetime64ns_dtype: Datetime641DArrayOverwrite,
     }[dtype]
@@ -586,11 +593,13 @@ class AdjustedArrayTestCase(TestCase):
 
     @parameterized.expand(
         chain(
+            _gen_overwrite_adjustment_cases(bool_dtype),
             _gen_overwrite_adjustment_cases(int64_dtype),
             _gen_overwrite_adjustment_cases(float64_dtype),
             _gen_overwrite_adjustment_cases(datetime64ns_dtype),
             _gen_overwrite_1d_array_adjustment_case(float64_dtype),
             _gen_overwrite_1d_array_adjustment_case(datetime64ns_dtype),
+            _gen_overwrite_1d_array_adjustment_case(bool_dtype),
             # There are six cases here:
             # Using np.bytes/np.unicode/object arrays as inputs.
             # Passing np.bytes/np.unicode/object arrays to LabelArray,
@@ -657,6 +666,65 @@ class AdjustedArrayTestCase(TestCase):
             )
             for yielded, expected_yield in zip_longest(window_iter, expected):
                 check_arrays(yielded, expected_yield)
+
+    def test_object1darrayoverwrite(self):
+        pairs = [u + l for u, l in product(ascii_uppercase, ascii_lowercase)]
+        categories = pairs + ['~' + c for c in pairs]
+        baseline = LabelArray(
+            array([[''.join((r, c)) for c in 'abc'] for r in ascii_uppercase]),
+            None,
+            categories,
+        )
+        full_expected = baseline.copy()
+
+        def flip(cs):
+            if cs is None:
+                return None
+            if cs[0] != '~':
+                return '~' + cs
+            return cs
+
+        def make_overwrite(fr, lr, fc, lc):
+            fr, lr, fc, lc = map(ord, (fr, lr, fc, lc))
+            fr -= ord('A')
+            lr -= ord('A')
+            fc -= ord('a')
+            lc -= ord('a')
+
+            return Object1DArrayOverwrite(
+                fr, lr,
+                fc, lc,
+                baseline[fr:lr + 1, fc].map(flip),
+            )
+
+        overwrites = {
+            3: [make_overwrite('A', 'B', 'a', 'a')],
+            4: [make_overwrite('A', 'C', 'b', 'c')],
+            5: [make_overwrite('D', 'D', 'a', 'b')],
+        }
+
+        it = AdjustedArray(baseline, overwrites, None).traverse(3)
+
+        window = next(it)
+        expected = full_expected[:3]
+        check_arrays(window, expected)
+
+        window = next(it)
+        full_expected[0:2, 0] = LabelArray(['~Aa', '~Ba'], None)
+        expected = full_expected[1:4]
+        check_arrays(window, expected)
+
+        window = next(it)
+        full_expected[0:3, 1:3] = LabelArray([['~Ab', '~Ac'],
+                                              ['~Bb', '~Bc'],
+                                              ['~Cb', '~Cb']], None)
+        expected = full_expected[2:5]
+        check_arrays(window, expected)
+
+        window = next(it)
+        full_expected[3, :2] = '~Da'
+        expected = full_expected[3:6]
+        check_arrays(window, expected)
 
     def test_invalid_lookback(self):
 
@@ -745,3 +813,63 @@ last_col=0, value=4.000000)]}
         # values and adjustment values.
         check_arrays(adj_array.data, expected_adj_array.data)
         self.assertEqual(adj_array.adjustments, expected_adj_array.adjustments)
+
+    A = Float64Multiply(0, 4, 1, 1, 0.5)
+    B = Float64Overwrite(3, 3, 4, 4, 4.2)
+    C = Float64Multiply(0, 2, 0, 0, 0.14)
+    D = Float64Overwrite(0, 3, 0, 0, 4.0)
+    E = Float64Overwrite(0, 0, 1, 1, 3.7)
+    F = Float64Multiply(0, 4, 3, 3, 10.0)
+    G = Float64Overwrite(5, 5, 4, 4, 1.7)
+    H = Float64Multiply(0, 4, 2, 2, 0.99)
+    S = Float64Multiply(0, 1, 4, 4, 5.06)
+
+    @parameterized.expand([(
+        # Initial adjustments
+        {
+            1: [A, B],
+            2: [C],
+            4: [D],
+        },
+
+        # Adjustments to add
+        {
+            1: [E],
+            2: [F, G],
+            3: [H, S],
+        },
+
+        # Expected adjustments with 'append'
+        {
+            1: [A, B, E],
+            2: [C, F, G],
+            3: [H, S],
+            4: [D],
+        },
+
+        # Expected adjustments with 'prepend'
+        {
+            1: [E, A, B],
+            2: [F, G, C],
+            3: [H, S],
+            4: [D],
+        },
+    )])
+    def test_update_adjustments(self,
+                                initial_adjustments,
+                                adjustments_to_add,
+                                expected_adjustments_with_append,
+                                expected_adjustments_with_prepend):
+        methods = ['append', 'prepend']
+        expected_outputs = [
+            expected_adjustments_with_append, expected_adjustments_with_prepend
+        ]
+
+        for method, expected_output in zip(methods, expected_outputs):
+            data = arange(30, dtype=float).reshape(6, 5)
+            adjusted_array = AdjustedArray(
+                data, initial_adjustments, float('nan')
+            )
+
+            adjusted_array.update_adjustments(adjustments_to_add, method)
+            self.assertEqual(adjusted_array.adjustments, expected_output)
